@@ -32,7 +32,7 @@ def load_voc_instances(dirname: str, split: str):
         split (str): one of "train", "test", "val", "trainval"
     """
     with PathManager.open(os.path.join(dirname, "ImageSets", "Main", split + ".txt")) as f:
-        fileids = np.loadtxt(f, dtype=np.str)
+        fileids = np.loadtxt(f, dtype=str)
 
     # shuffle(CLASS_NAMES)
 

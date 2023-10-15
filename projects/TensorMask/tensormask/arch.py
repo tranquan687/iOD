@@ -1,6 +1,5 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Copyright (c) Facebook, Inc. and its affiliates.
 import copy
-import logging
 import math
 from typing import List
 import torch
@@ -13,16 +12,31 @@ from detectron2.modeling.anchor_generator import DefaultAnchorGenerator
 from detectron2.modeling.backbone import build_backbone
 from detectron2.modeling.box_regression import Box2BoxTransform
 from detectron2.modeling.meta_arch.build import META_ARCH_REGISTRY
-from detectron2.modeling.meta_arch.retinanet import (
-    permute_all_cls_and_box_to_N_HWA_K_and_concat,
-    permute_to_N_HWA_K,
-)
+from detectron2.modeling.meta_arch.retinanet import permute_to_N_HWA_K
 from detectron2.structures import Boxes, ImageList, Instances
-from detectron2.utils.logger import log_first_n
 
 from tensormask.layers import SwapAlign2Nat
 
 __all__ = ["TensorMask"]
+
+
+def permute_all_cls_and_box_to_N_HWA_K_and_concat(pred_logits, pred_anchor_deltas, num_classes=80):
+    """
+    Rearrange the tensor layout from the network output, i.e.:
+    list[Tensor]: #lvl tensors of shape (N, A x K, Hi, Wi)
+    to per-image predictions, i.e.:
+    Tensor: of shape (N x sum(Hi x Wi x A), K)
+    """
+    # for each feature level, permute the outputs to make them be in the
+    # same format as the labels.
+    pred_logits_flattened = [permute_to_N_HWA_K(x, num_classes) for x in pred_logits]
+    pred_anchor_deltas_flattened = [permute_to_N_HWA_K(x, 4) for x in pred_anchor_deltas]
+    # concatenate on the first dimension (representing the feature levels), to
+    # take into account the way the labels were generated (with all feature maps
+    # being concatenated as well)
+    pred_logits = cat(pred_logits_flattened, dim=1).view(-1, num_classes)
+    pred_anchor_deltas = cat(pred_anchor_deltas_flattened, dim=1).view(-1, 4)
+    return pred_logits, pred_anchor_deltas
 
 
 def _assignment_rule(
@@ -274,6 +288,8 @@ class TensorMaskAnchorGenerator(DefaultAnchorGenerator):
         # Convert anchors from Tensor to Boxes
         anchors_per_im = [Boxes(x) for x in anchors_list]
 
+        # TODO it can be simplified to not return duplicated information for
+        # each image, just like detectron2's own AnchorGenerator
         anchors = [copy.deepcopy(anchors_per_im) for _ in range(num_images)]
         unit_lengths = [copy.deepcopy(lengths_list) for _ in range(num_images)]
         indexes = [copy.deepcopy(indexes_list) for _ in range(num_images)]
@@ -292,9 +308,6 @@ class TensorMask(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
-        # get the deice of the model
-        self.device = torch.device(cfg.MODEL.DEVICE)
-
         # fmt: off
         self.num_classes              = cfg.MODEL.TENSOR_MASK.NUM_CLASSES
         self.in_features              = cfg.MODEL.TENSOR_MASK.IN_FEATURES
@@ -312,8 +325,7 @@ class TensorMask(nn.Module):
         self.mask_on                  = cfg.MODEL.MASK_ON
         self.mask_loss_weight         = cfg.MODEL.TENSOR_MASK.MASK_LOSS_WEIGHT
         self.mask_pos_weight          = torch.tensor(cfg.MODEL.TENSOR_MASK.POSITIVE_WEIGHT,
-                                                     dtype=torch.float32,
-                                                     device=self.device)
+                                                     dtype=torch.float32)
         self.bipyramid_on             = cfg.MODEL.TENSOR_MASK.BIPYRAMID_ON
         # fmt: on
 
@@ -336,10 +348,12 @@ class TensorMask(nn.Module):
         )
         # box transform
         self.box2box_transform = Box2BoxTransform(weights=cfg.MODEL.TENSOR_MASK.BBOX_REG_WEIGHTS)
-        pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
-        pixel_std = torch.Tensor(cfg.MODEL.PIXEL_STD).to(self.device).view(3, 1, 1)
-        self.normalizer = lambda x: (x - pixel_mean) / pixel_std
-        self.to(self.device)
+        self.register_buffer("pixel_mean", torch.tensor(cfg.MODEL.PIXEL_MEAN).view(-1, 1, 1), False)
+        self.register_buffer("pixel_std", torch.tensor(cfg.MODEL.PIXEL_STD).view(-1, 1, 1), False)
+
+    @property
+    def device(self):
+        return self.pixel_mean.device
 
     def forward(self, batched_inputs):
         """
@@ -359,11 +373,6 @@ class TensorMask(nn.Module):
         images = self.preprocess_image(batched_inputs)
         if "instances" in batched_inputs[0]:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-        elif "targets" in batched_inputs[0]:
-            log_first_n(
-                logging.WARN, "'targets' in the model inputs is now renamed to 'instances'!", n=10
-            )
-            gt_instances = [x["targets"].to(self.device) for x in batched_inputs]
         else:
             gt_instances = None
 
@@ -459,7 +468,7 @@ class TensorMask(nn.Module):
         if self.mask_on:
             loss_mask = 0
             for lvl in range(self.num_levels):
-                cur_level_factor = 2 ** lvl if self.bipyramid_on else 1
+                cur_level_factor = 2**lvl if self.bipyramid_on else 1
                 for anc in range(self.num_anchors):
                     cur_gt_mask_inds = gt_mask_inds[lvl][anc]
                     if cur_gt_mask_inds is None:
@@ -468,7 +477,7 @@ class TensorMask(nn.Module):
                         cur_mask_size = self.mask_sizes[anc] * cur_level_factor
                         # TODO maybe there are numerical issues when mask sizes are large
                         cur_size_divider = torch.tensor(
-                            self.mask_loss_weight / (cur_mask_size ** 2),
+                            self.mask_loss_weight / (cur_mask_size**2),
                             dtype=torch.float32,
                             device=self.device,
                         )
@@ -582,7 +591,7 @@ class TensorMask(nn.Module):
                     for lvl in range(self.num_levels):
                         ids_lvl = matched_indexes[:, 0] == lvl
                         if torch.any(ids_lvl):
-                            cur_level_factor = 2 ** lvl if self.bipyramid_on else 1
+                            cur_level_factor = 2**lvl if self.bipyramid_on else 1
                             for anc in range(self.num_anchors):
                                 ids_lvl_anchor = ids_lvl & (matched_indexes[:, 4] == anc)
                                 if torch.any(ids_lvl_anchor):
@@ -725,7 +734,7 @@ class TensorMask(nn.Module):
             result_anchors = top_anchors[keep]
             # Get masks and do sigmoid
             for lvl, _, h, w, anc in result_indexes.tolist():
-                cur_size = self.mask_sizes[anc] * (2 ** lvl if self.bipyramid_on else 1)
+                cur_size = self.mask_sizes[anc] * (2**lvl if self.bipyramid_on else 1)
                 result_masks.append(
                     torch.sigmoid(pred_masks[lvl][anc][:, h, w].view(1, cur_size, cur_size))
                 )
@@ -737,7 +746,7 @@ class TensorMask(nn.Module):
         Normalize, pad and batch the input images.
         """
         images = [x["image"].to(self.device) for x in batched_inputs]
-        images = [self.normalizer(x) for x in images]
+        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.backbone.size_divisibility)
         return images
 
@@ -822,7 +831,7 @@ class TensorMaskHead(nn.Module):
                 if self.bipyramid_on:
                     for lvl in range(num_levels):
                         cur_mask_module = "align2nat_%02d" % lvl
-                        lambda_val = 2 ** lvl
+                        lambda_val = 2**lvl
                         setattr(self, cur_mask_module, SwapAlign2Nat(lambda_val))
                     # Also the fusing layer, stay at the same channel size
                     mask_fuse = [
@@ -842,7 +851,7 @@ class TensorMaskHead(nn.Module):
                     torch.nn.init.constant_(layer.bias, 0)
 
         # Use prior in model initialization to improve stability
-        bias_value = -math.log((1 - 0.01) / 0.01)
+        bias_value = -(math.log((1 - 0.01) / 0.01))
         torch.nn.init.constant_(self.cls_score.bias, bias_value)
 
     def forward(self, features):
@@ -876,7 +885,7 @@ class TensorMaskHead(nn.Module):
                 H, W = mask_feat_high_res.shape[-2:]
                 mask_feats_up = []
                 for lvl, mask_feat in enumerate(mask_feats):
-                    lambda_val = 2.0 ** lvl
+                    lambda_val = 2.0**lvl
                     mask_feat_up = mask_feat
                     if lvl > 0:
                         mask_feat_up = F.interpolate(

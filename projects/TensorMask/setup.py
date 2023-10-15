@@ -1,14 +1,11 @@
 #!/usr/bin/env python
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Copyright (c) Facebook, Inc. and its affiliates.
 
 import glob
 import os
 from setuptools import find_packages, setup
 import torch
 from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
-
-torch_ver = [int(x) for x in torch.__version__.split(".")[:2]]
-assert torch_ver >= [1, 3], "Requires PyTorch >= 1.3"
 
 
 def get_extensions():
@@ -66,7 +63,7 @@ setup(
     version="0.1",
     author="FAIR",
     packages=find_packages(exclude=("configs", "tests")),
-    python_requires=">=3.6",
+    python_requires=">=3.7",
     ext_modules=get_extensions(),
     cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
 )

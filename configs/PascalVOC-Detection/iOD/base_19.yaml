@@ -1,6 +1,7 @@
 _BASE_: "../../Base-RCNN-C4.yaml"
 MODEL:
-  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
+#  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
+  WEIGHTS: "/media/quan/DATA/Quan/IIPP/increment_learning/detectron2/R-50.pkl"
   MASK_ON: False
   RESNETS:
     DEPTH: 50
